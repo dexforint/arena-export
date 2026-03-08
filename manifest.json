@@ -1,9 +1,9 @@
 {
 	"manifest_version": 3,
 	"name": "Arena.ai Dialog Export",
-	"version": "0.3.0",
+	"version": "0.5.0",
 	"description": "Экспортирует сообщения диалога arena.ai в Markdown файлы.",
-	"permissions": ["activeTab", "downloads"],
+	"permissions": ["activeTab", "downloads", "debugger", "offscreen", "clipboardRead"],
 	"host_permissions": ["https://arena.ai/*", "https://*.arena.ai/*"],
 	"background": {
 		"service_worker": "background.js"
@@ -14,7 +14,7 @@
 	"content_scripts": [
 		{
 			"matches": ["https://arena.ai/*", "https://*.arena.ai/*"],
-			"js": ["vendor/turndown.js", "vendor/turndown-plugin-gfm.js", "content.js"],
+			"js": ["content.js"],
 			"run_at": "document_idle"
 		}
 	]
