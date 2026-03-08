@@ -1,14 +1,32 @@
 let exportInProgress = false;
+let requestCounter = 0;
+const pendingRequests = new Map();
+
+window.addEventListener("message", (event) => {
+	if (event.source !== window) {
+		return;
+	}
+
+	const data = event.data;
+	if (!data || data.source !== "arena-export-page" || data.type !== "EXTRACT_REACT_MARKDOWN_RESULT") {
+		return;
+	}
+
+	const requestId = data.requestId;
+	const pending = pendingRequests.get(requestId);
+	if (!pending) {
+		return;
+	}
+
+	pendingRequests.delete(requestId);
+	pending.resolve(data.results || {});
+});
 
 chrome.runtime.onMessage.addListener((message) => {
 	if (message?.type === "ARENA_EXPORT_START") {
 		void runExport();
 	}
 });
-
-function delay(ms) {
-	return new Promise((resolve) => window.setTimeout(resolve, ms));
-}
 
 function sanitizeFileName(value) {
 	return (
@@ -119,236 +137,214 @@ function getMessageCopyButtons() {
 			button,
 			role: classifyMessageCopyButton(button),
 		}))
-		.filter((item) => item.role)
-		.sort((a, b) => {
-			const aRect = a.button.getBoundingClientRect();
-			const bRect = b.button.getBoundingClientRect();
-
-			if (Math.abs(aRect.top - bRect.top) > 4) {
-				return aRect.top - bRect.top;
-			}
-
-			return aRect.left - bRect.left;
-		});
+		.filter((item) => item.role);
 }
 
-function getElementCenter(element) {
-	const rect = element.getBoundingClientRect();
+function countMessageCopyButtonsInside(root) {
+	let count = 0;
 
-	if (rect.width <= 0 || rect.height <= 0) {
-		throw new Error("Element is not visible");
-	}
-
-	return {
-		x: rect.left + rect.width / 2,
-		y: rect.top + rect.height / 2,
-	};
-}
-
-async function debuggerStart() {
-	const result = await chrome.runtime.sendMessage({
-		type: "ARENA_DEBUGGER_START",
-	});
-
-	if (!result?.ok) {
-		throw new Error(result?.error || "Failed to attach debugger");
-	}
-}
-
-async function debuggerEnd() {
-	try {
-		await chrome.runtime.sendMessage({
-			type: "ARENA_DEBUGGER_END",
-		});
-	} catch (_error) {
-		// ignore
-	}
-}
-
-async function trustedMoveToElement(element) {
-	const { x, y } = getElementCenter(element);
-
-	const result = await chrome.runtime.sendMessage({
-		type: "ARENA_DEBUGGER_TRUSTED_MOVE",
-		x,
-		y,
-	});
-
-	if (!result?.ok) {
-		throw new Error(result?.error || "Trusted move failed");
-	}
-}
-
-async function trustedClickElement(element) {
-	const { x, y } = getElementCenter(element);
-
-	const result = await chrome.runtime.sendMessage({
-		type: "ARENA_DEBUGGER_TRUSTED_CLICK",
-		x,
-		y,
-	});
-
-	if (!result?.ok) {
-		throw new Error(result?.error || "Trusted click failed");
-	}
-}
-
-async function readClipboardPayload() {
-	const result = await chrome.runtime.sendMessage({
-		type: "ARENA_CLIPBOARD_READ",
-	});
-
-	if (!result?.ok) {
-		throw new Error(result?.error || "Clipboard read failed");
-	}
-
-	return {
-		text: String(result.text || ""),
-		mime: String(result.mime || ""),
-	};
-}
-
-function getSuccessSvg(button) {
-	return (
-		Array.from(button.querySelectorAll("svg")).find((svg) => {
-			const paths = Array.from(svg.querySelectorAll("path"))
-				.map((node) => node.getAttribute("d") || "")
-				.join(" ");
-
-			return paths.includes("M5 13L9 17L19 7");
-		}) || null
-	);
-}
-
-function isButtonShowingCopiedState(button) {
-	const svg = getSuccessSvg(button);
-	if (!svg) {
-		return false;
-	}
-
-	const opacity = Number.parseFloat(getComputedStyle(svg).opacity || "0");
-	return opacity > 0.5;
-}
-
-async function waitForClipboardAfterClick(previousText, button, timeoutMs = 7000) {
-	const startedAt = Date.now();
-
-	while (Date.now() - startedAt < timeoutMs) {
-		try {
-			const payload = await readClipboardPayload();
-			const text = payload.text.trim();
-
-			if (text) {
-				if (text !== String(previousText || "").trim()) {
-					return payload;
-				}
-
-				if (isButtonShowingCopiedState(button)) {
-					return payload;
-				}
-			}
-		} catch (_error) {
-			// ignore and retry
-		}
-
-		await delay(150);
-	}
-
-	throw new Error("Clipboard timeout");
-}
-
-async function copyMessageFromButton(button, position) {
-	let lastError = new Error("Unknown error");
-
-	for (let attempt = 0; attempt < 3; attempt += 1) {
-		try {
-			button.scrollIntoView({
-				block: "center",
-				inline: "nearest",
-			});
-
-			await delay(250);
-
-			const hoverTarget = button.closest(".group") || button.parentElement || button;
-
-			await trustedMoveToElement(hoverTarget);
-			await delay(180);
-
-			await trustedMoveToElement(button);
-			await delay(120);
-
-			let beforeText = "";
-			try {
-				const before = await readClipboardPayload();
-				beforeText = before.text;
-			} catch (_error) {
-				beforeText = "";
-			}
-
-			await trustedClickElement(button);
-
-			const after = await waitForClipboardAfterClick(beforeText, button, 7000);
-
-			if (!after.text.trim()) {
-				throw new Error("Empty copied text");
-			}
-
-			return after.text;
-		} catch (error) {
-			lastError = error instanceof Error ? error : new Error(String(error));
-			await delay(300);
+	for (const button of root.querySelectorAll("button")) {
+		if (classifyMessageCopyButton(button)) {
+			count += 1;
 		}
 	}
 
-	throw new Error(`Message ${position}: ${lastError.message}`);
+	return count;
+}
+
+function getNodeTextLength(node) {
+	return String(node?.innerText || node?.textContent || "")
+		.replace(/\s+/g, " ")
+		.trim().length;
+}
+
+function findMessageContainer(button) {
+	let node = button.parentElement;
+	let best = null;
+
+	while (node && node !== document.body && node !== document.documentElement) {
+		const copyCount = countMessageCopyButtonsInside(node);
+		const textLength = getNodeTextLength(node);
+
+		if (copyCount === 1 && textLength > 0) {
+			best = node;
+		} else if (copyCount > 1 && best) {
+			break;
+		}
+
+		node = node.parentElement;
+	}
+
+	return best;
+}
+
+function compareNodesInDocumentOrder(a, b) {
+	if (a === b) {
+		return 0;
+	}
+
+	const position = a.compareDocumentPosition(b);
+
+	if (position & Node.DOCUMENT_POSITION_FOLLOWING) {
+		return -1;
+	}
+
+	if (position & Node.DOCUMENT_POSITION_PRECEDING) {
+		return 1;
+	}
+
+	return 0;
+}
+
+function getVisualPosition(node) {
+	const rect = node.getBoundingClientRect();
+
+	return {
+		top: rect.top + window.scrollY,
+		left: rect.left + window.scrollX,
+	};
+}
+
+function sortEntriesByVisualOrder(entries) {
+	return entries.slice().sort((a, b) => {
+		const aPos = getVisualPosition(a.root);
+		const bPos = getVisualPosition(b.root);
+
+		if (Math.abs(aPos.top - bPos.top) > 4) {
+			return aPos.top - bPos.top;
+		}
+
+		if (Math.abs(aPos.left - bPos.left) > 4) {
+			return aPos.left - bPos.left;
+		}
+
+		return compareNodesInDocumentOrder(a.root, b.root);
+	});
+}
+
+function requestReactMarkdown(items) {
+	const requestId = `arena-export-${Date.now()}-${++requestCounter}`;
+
+	return new Promise((resolve, reject) => {
+		const timeoutId = window.setTimeout(() => {
+			pendingRequests.delete(requestId);
+			reject(new Error("Page bridge timeout"));
+		}, 5000);
+
+		pendingRequests.set(requestId, {
+			resolve: (result) => {
+				window.clearTimeout(timeoutId);
+				resolve(result);
+			},
+		});
+
+		window.postMessage(
+			{
+				source: "arena-export-content",
+				type: "EXTRACT_REACT_MARKDOWN",
+				requestId,
+				items,
+			},
+			"*",
+		);
+	});
 }
 
 async function runExport() {
 	if (exportInProgress) {
-		showToast("Экспорт уже идет");
+		showToast("Export is already underway");
 		return;
 	}
 
 	exportInProgress = true;
 
 	try {
-		const items = getMessageCopyButtons();
-		if (items.length === 0) {
-			throw new Error("Не нашел кнопки копирования сообщений");
+		const buttonItems = getMessageCopyButtons();
+		if (buttonItems.length === 0) {
+			throw new Error("Didn't find a copy message button");
 		}
 
-		showToast(`Найдено ${items.length} сообщений`);
+		const entries = [];
+		const usedRoots = new Set();
 
-		await debuggerStart();
+		for (const item of buttonItems) {
+			const root = findMessageContainer(item.button);
 
-		const files = [];
+			if (!root || usedRoots.has(root)) {
+				continue;
+			}
 
-		for (let i = 0; i < items.length; i += 1) {
-			showToast(`Копирую ${i + 1} / ${items.length}...`);
+			usedRoots.add(root);
 
-			const markdown = await copyMessageFromButton(items[i].button, i + 1);
-			files.push({
-				name: `${i + 1}.md`,
-				text: normalizeMarkdown(markdown),
+			entries.push({
+				root,
+				role: item.role,
 			});
 		}
 
-		const result = await chrome.runtime.sendMessage({
+		const orderedEntries = sortEntriesByVisualOrder(entries);
+
+		if (orderedEntries.length === 0) {
+			throw new Error("Could not find message containers");
+		}
+
+		const requestItems = orderedEntries.map((entry, index) => {
+			const id = `arena-export-msg-${index + 1}`;
+			entry.root.setAttribute("data-arena-export-id", id);
+			return { id };
+		});
+
+		showToast(`Exporting ${orderedEntries.length} messages...`);
+
+		const results = await requestReactMarkdown(requestItems);
+		const files = [];
+		const debugRows = [];
+
+		for (let i = 0; i < orderedEntries.length; i += 1) {
+			const id = requestItems[i].id;
+			const result = results[id];
+
+			if (!result?.ok || !result.text) {
+				console.log("[arena-export] Failed container:", orderedEntries[i].root);
+				console.log("[arena-export] Top candidates:", result?.top || result);
+				throw new Error(`Didn't find Markdown in React props for message ${i + 1}`);
+			}
+
+			files.push({
+				name: `${i + 1}.md`,
+				text: normalizeMarkdown(result.text),
+			});
+
+			debugRows.push({
+				n: i + 1,
+				role: orderedEntries[i].role,
+				score: result.score,
+				path: result.path,
+				preview: String(result.text).slice(0, 140).replace(/\n/g, "\\n"),
+			});
+		}
+
+		console.table(debugRows);
+
+		const downloadResult = await chrome.runtime.sendMessage({
 			type: "ARENA_EXPORT_DOWNLOAD",
 			folderName: buildFolderName(),
 			files,
 		});
 
-		if (!result?.ok) {
-			throw new Error(result?.error || "Не удалось скачать файлы");
+		if (!downloadResult?.ok) {
+			throw new Error(downloadResult?.error || "Failed to download files");
 		}
 
-		showToast(`Готово: ${files.length} файлов`);
+		showToast(`Done: ${files.length} files`);
 	} catch (error) {
 		console.error("[arena-export]", error);
-		showToast(`Ошибка: ${error instanceof Error ? error.message : String(error)}`);
+		showToast(`Error: ${error instanceof Error ? error.message : String(error)}`);
 	} finally {
-		await debuggerEnd();
+		for (const node of document.querySelectorAll("[data-arena-export-id]")) {
+			node.removeAttribute("data-arena-export-id");
+		}
+
 		exportInProgress = false;
 	}
 }
