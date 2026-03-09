@@ -11,7 +11,7 @@ The folder name corresponds to the chat id (in the url).
 
 ## Installation
 
-Go to the browser extensions page, turn on developer mode and download the folder with the extension.
+Go to the browser extensions page, turn on developer mode and load the folder with the extension.
 
 ## Usage
 
